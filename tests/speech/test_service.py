@@ -1,12 +1,15 @@
+import struct
 import tempfile
 import threading
 import time
 import unittest
+import wave
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from uuid import uuid4
 
+from wgtts.speech.playback import WavePlayer
 from wgtts.speech.service import SpeechService
 
 WAV = b"RIFF0000WAVEtest"
@@ -153,7 +156,7 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(started.wait(2))
         service.say("Второй", replace=False)
         service.stop()
-        self.assertEqual(service.state, "idle")
+        self.assertEqual(service.state, "paused")
         self.assertFalse(service.pending)
         player.stop.assert_called()
 
@@ -309,6 +312,118 @@ class RecordingTests(unittest.TestCase):
         self.assertTrue(text.startswith("До\nТаблица."))
         self.assertTrue(text.endswith("Конец таблицы.\nПосле"))
         self.assertNotIn("|", text)
+
+    def positioned_service(self):
+        self.now = 0.0
+
+        def synthesize(*args):
+            path = self.synthesize()
+            with wave.open(str(path), "wb") as audio:
+                audio.setparams((1, 2, 100, 0, "NONE", "not compressed"))
+                audio.writeframes(struct.pack("<3000h", *range(3000)))
+            return path
+
+        self.client.synthesize.side_effect = synthesize
+        patcher = patch("sounddevice.RawOutputStream")
+        stream_type = patcher.start()
+        self.addCleanup(patcher.stop)
+        stream_type.return_value.latency = 0
+        player = WavePlayer(clock=lambda: self.now)
+        service = SpeechService(
+            self.settings,
+            self.directory,
+            notify=lambda _: None,
+            client_factory=lambda _: self.client,
+            player=player,
+        )
+        self.addCleanup(service.close)
+        service.say("Ответ с позицией")
+        self.wait_for(lambda: service.state == "playing")
+        return service
+
+    def test_pause_resume_keeps_position_without_changing_voice_or_generating(self):
+        service = self.positioned_service()
+        self.now = 8.0
+        service.stop()
+        self.assertEqual(service.state, "paused")
+        self.assertEqual(service.progress, (8.0, 30.0))
+        self.now = 100.0
+        self.settings.data["tts"]["ttsRate"] = 20
+        self.assertTrue(service.resume())
+        self.wait_for(lambda: service.state == "playing")
+        self.assertEqual(service.progress, (8.0, 30.0))
+        self.assertEqual(self.client.synthesize.call_count, 1)
+        self.assertTrue(self.paths[0].exists())
+
+    def test_seeking_playing_restarts_timer_and_seeking_paused_stays_silent(self):
+        service = self.positioned_service()
+        self.now = 5.0
+        service.player.start = Mock(wraps=service.player.start)
+        self.assertEqual(service.seek(-3, relative=True), 2.0)
+        self.wait_for(lambda: service.state == "playing")
+        self.assertEqual(service.progress, (2.0, 30.0))
+        self.assertEqual(service.player.start.call_count, 1)
+        service.stop()
+        self.assertEqual(service.seek(20), 20.0)
+        self.assertFalse(service.busy)
+        self.assertEqual(service.state, "paused")
+        self.assertEqual(service.player.start.call_count, 1)
+        service.resume()
+        self.wait_for(lambda: service.state == "playing")
+        self.assertEqual(service.progress, (20.0, 30.0))
+        self.assertEqual(self.client.synthesize.call_count, 1)
+
+    def test_restart_is_explicit_and_next_recording_resets_position(self):
+        service = self.positioned_service()
+        self.now = 9.0
+        service.stop()
+        self.assertTrue(service.restart())
+        self.wait_for(lambda: service.state == "playing")
+        self.assertEqual(service.progress, (0.0, 30.0))
+        self.assertEqual(self.client.synthesize.call_count, 1)
+        self.now = 15.0
+        service.say("Другой ответ")
+        self.wait_for(lambda: service.state == "playing")
+        self.assertEqual(service.progress, (0.0, 30.0))
+        self.assertEqual(self.client.synthesize.call_count, 2)
+        self.assertFalse(self.paths[0].exists())
+
+    def test_seek_to_end_stays_at_end_and_stale_resume_is_ignored(self):
+        service = self.positioned_service()
+        revision = service.cancel_revision
+        service.stop()
+        self.assertFalse(service.resume(expected_revision=revision))
+        self.assertEqual(service.seek(1000), 30.0)
+        self.assertEqual(service.state, "paused")
+        self.assertFalse(service.busy)
+
+    def test_seek_preserves_auto_queue_but_pause_clears_it(self):
+        service = self.positioned_service()
+        service.say("Ответ в очереди", replace=False)
+        service.seek(10)
+        self.wait_for(lambda: service.state == "playing")
+        self.assertEqual([text for text, _ in service.pending], ["Ответ в очереди"])
+        service.stop()
+        self.assertFalse(service.pending)
+
+    def test_old_timer_cannot_end_playback_after_seek(self):
+        service = self.positioned_service()
+        service.stop()
+        start = service.player.start
+        durations = iter((0.05, 20.05))
+
+        def shortened(path):
+            start(path)
+            return next(durations)
+
+        service.player.start = Mock(side_effect=shortened)
+        service.resume()
+        self.wait_for(lambda: service.state == "playing")
+        service.seek(1)
+        self.wait_for(lambda: service.player.start.call_count == 2 and service.state == "playing")
+        time.sleep(0.1)
+        self.assertEqual(service.state, "playing")
+        self.assertEqual(self.client.synthesize.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -47,6 +47,8 @@ class TerminalTests(unittest.TestCase):
             ScanResult("Чат", self.old, True, True, 2, session_key=session)
         )
         terminal = Terminal(self.directory)
+        terminal.speech.progress = (0.0, 0.0)
+        terminal.speech.resume.return_value = False
         self.addCleanup(terminal.close)
         return terminal
 
@@ -159,6 +161,55 @@ class TerminalTests(unittest.TestCase):
         terminal.notify("Запоздалый ответ сервиса")
         terminal.write("Запоздалый результат команды")
         self.assertEqual(self.output.getvalue(), "")
+
+    def test_start_resumes_paused_recording_and_auto_instead_of_saying_selection(self):
+        terminal = self.make_terminal()
+        terminal.auto_mode = True
+        terminal.speech.resume.return_value = True
+        terminal.execute("start")
+        terminal.speech.resume.assert_called_once_with(expected_revision=None)
+        terminal.speech.say.assert_not_called()
+        terminal.auto.set_enabled.assert_called_with(True)
+
+    def test_widget_resume_and_seek_bypass_long_command_queue(self):
+        terminal = self.make_terminal()
+        terminal.enqueue("scan")
+        terminal.speech.state = "paused"
+        terminal.speech.resume.return_value = True
+        terminal.submit_command("start")
+        terminal.speech.resume.assert_called_once_with()
+        terminal.speech.seek.return_value = 30.0
+        terminal.submit_command("seek +10")
+        terminal.speech.seek.assert_called_once_with(10, relative=True)
+        self.assertEqual(terminal.commands.qsize(), 1)
+
+    def test_seek_commands_support_absolute_time_and_relative_offsets(self):
+        terminal = self.make_terminal()
+        terminal.speech.seek.return_value = 90.0
+        for command, seconds, relative in (
+            ("seek 1:30", 90, False),
+            ("seek 90", 90, False),
+            ("seek -10", -10, True),
+            ("seek +10", 10, True),
+        ):
+            with self.subTest(command=command):
+                terminal.execute(command)
+                terminal.speech.seek.assert_called_with(seconds, relative=relative)
+        for command in ("seek", "seek nan", "seek 1:60", "seek 1 2"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                terminal.execute(command)
+
+    def test_status_shows_position_and_restart_uses_current_recording(self):
+        terminal = self.make_terminal()
+        terminal.speech.progress = (90.0, 180.0)
+        terminal.speech.state = "paused"
+        self.assertIn("пауза · 1:30 / 3:00", terminal.screen_status())
+        terminal.execute("status")
+        self.assertIn("Запись: 1:30 / 3:00", self.output.getvalue())
+        terminal.speech.restart.return_value = True
+        terminal.execute("restart")
+        terminal.speech.restart.assert_called_once_with(expected_revision=None)
+        terminal.speech.say.assert_not_called()
 
 
 if __name__ == "__main__":

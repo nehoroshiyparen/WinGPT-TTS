@@ -11,6 +11,7 @@ from wgtts.chat.scanner import scan_chat
 from wgtts.chat.watcher import AutoReader
 from wgtts.settings import Settings
 from wgtts.speech.applio import ApplioClient, ApplioError
+from wgtts.speech.playback import format_time, parse_time
 from wgtts.speech.service import SpeechService
 
 HELP = """Команды:
@@ -21,7 +22,10 @@ HELP = """Команды:
   next / prev       выбрать и показать следующее / предыдущее сообщение
   last              выбрать последний ответ ассистента
   say [НОМЕР]       озвучить выбранное сообщение или указанный номер
-  start / stop      запустить / остановить озвучку (и приостановить auto)
+  start / stop      продолжить / поставить на паузу (и приостановить auto)
+  seek +10 / -10    перемотать вперёд / назад на 10 секунд
+  seek 1:30         перейти на 1 минуту 30 секунд (или seek 90)
+  restart           воспроизвести текущую запись с начала
   auto on / off     новые ответы автоматически / ручной режим
   applio            взять последние рабочие настройки TTS из Applio
   settings          показать настройки озвучки и чтения
@@ -113,17 +117,33 @@ class Terminal:
             "idle": "готов",
             "preparing": "готовлю голос",
             "playing": "говорю",
+            "paused": "пауза",
             "error": "ошибка",
         }.get(self.speech.state, self.speech.state)
         count = len(self.history.messages) if self.history else 0
         selection = f"#{self.selected + 1} из {count}" if count else "нет сообщений"
         mode = "авто" if self.auto_mode else "ручной"
-        return f"{speech} · {mode} · громкость {self.settings.data['volume']}% · {selection}"
+        position, duration = self.speech.progress
+        timeline = f" · {format_time(position)} / {format_time(duration)}" if duration else ""
+        return (
+            f"{speech}{timeline} · {mode} · громкость {self.settings.data['volume']}% · {selection}"
+        )
 
     def submit_command(self, command):
-        if command.strip() == "stop":
+        if command.strip() in {"stop", "pause"}:
             # Stop bypasses the queue, including a long scan or network request.
             self.stop()
+        elif command.strip() == "start" and self.speech.state == "paused":
+            if self.speech.resume():
+                if self.auto_mode:
+                    self.auto.set_enabled(True)
+                self.notify("Продолжаю с сохранённой позиции.")
+        elif command.strip().split(" ")[0] == "seek":
+            # Transport controls stay responsive even while scan owns the worker.
+            try:
+                self.execute(command)
+            except ValueError as error:
+                self.notify(str(error))
         elif command.strip() in {"quit", "exit"}:
             self.done.set()
         elif command.strip():
@@ -166,7 +186,13 @@ class Terminal:
         with self.history_lock:
             self.auto.set_enabled(False)
             self.speech.stop()
-        self.notify("Остановлено. Для продолжения: start.")
+        self.notify("Пауза. start — продолжить; seek -10 — назад; restart — с начала.")
+
+    def seek(self, seconds, *, relative=False):
+        try:
+            self.speech.seek(seconds, relative=relative)
+        except ValueError as error:
+            self.notify(str(error))
 
     def resize_widget(self, size):
         try:
@@ -311,16 +337,36 @@ class Terminal:
                 f"Озвучка: {self.speech.state}. Режим: {'авто' if self.auto_mode else 'ручной'}; наблюдение: {'включено' if self.auto.enabled.is_set() else 'выключено'}"
             )
             self.write("Авто: " + self.auto.status)
+            position, duration = self.speech.progress
+            self.write(f"Запись: {format_time(position)} / {format_time(duration)}")
         elif name in ("say", "play"):
             self._say(args)
         elif name == "start":
-            if self.auto_mode:
+            if not args and self.speech.resume(expected_revision=self.command_revision):
+                if self.auto_mode:
+                    self.auto.set_enabled(True)
+                self.write("Продолжаю с сохранённой позиции.")
+            elif self.auto_mode:
                 self.auto.set_enabled(True)
                 self.write("Жду новые ответы в открытом чате. Держи чат прокрученным к концу.")
             else:
                 self._say(args)
-        elif name == "stop":
+        elif name in ("stop", "pause"):
             self.stop()
+        elif name == "seek":
+            if len(args) != 1:
+                raise ValueError("Используй: seek +10, seek -10 или seek 1:30.")
+            seconds, relative = parse_time(args[0])
+            position = self.speech.seek(seconds, relative=relative)
+            if position is not None:
+                self.notify(f"Позиция: {format_time(position)}")
+        elif name == "restart":
+            if args:
+                raise ValueError("Используй: restart — текущая запись с начала.")
+            if not self.speech.restart(expected_revision=self.command_revision):
+                self._say([])
+            else:
+                self.write("Воспроизвожу запись с начала.")
         elif name == "auto":
             if args not in (["on"], ["off"]):
                 raise ValueError("Используй: auto on или auto off")
@@ -415,6 +461,7 @@ class Terminal:
                     "start",
                     "say",
                     "play",
+                    "restart",
                 }:
                     continue
                 screen = self.screen

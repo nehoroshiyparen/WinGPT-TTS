@@ -2,6 +2,7 @@
 
 from collections import deque
 from copy import deepcopy
+from math import isfinite
 from pathlib import Path
 from threading import Condition, Event, Thread
 
@@ -28,6 +29,7 @@ class SpeechService:
         self.state = "idle"
         self.epoch = 0
         self.cancel_revision = 0
+        self.current = None
         self.worker = Thread(target=self._run, name="speech", daemon=True)
         self.worker.start()
 
@@ -47,19 +49,76 @@ class SpeechService:
             if replace:
                 self._stop_locked()
             self.pending.append((text, deepcopy(self.settings.data)))
+            if replace or self.state != "playing":
+                self.state = "preparing"
             self.condition.notify_all()
 
-    def _stop_locked(self):
+    @property
+    def progress(self):
+        with self.condition:
+            return self.player.position, self.player.duration
+
+    def _stop_locked(self, *, clear_pending=True):
+        paused = self.state in {"playing", "paused"} and self.current is not None
         self.epoch += 1
-        self.pending.clear()
+        if clear_pending:
+            self.pending.clear()
         self.cancel.set()
         self.player.stop()
-        self.state = "idle"
+        self.state = "paused" if paused else "idle"
 
     def stop(self):
         with self.condition:
             self.cancel_revision += 1
             self._stop_locked()
+
+    def resume(self, *, expected_revision=None):
+        with self.condition:
+            if self.closed or (
+                expected_revision is not None and expected_revision != self.cancel_revision
+            ):
+                return False
+            if self.state != "paused" or self.current is None:
+                return False
+            self._stop_locked()
+            self.pending.append(self.current)
+            self.condition.notify_all()
+            return True
+
+    def seek(self, seconds, *, relative=False):
+        if not isfinite(seconds):
+            raise ValueError("Позиция должна быть конечным числом секунд.")
+        with self.condition:
+            if self.closed:
+                return
+            if self.state == "preparing" or (self.pending and self.state != "playing"):
+                raise ValueError("Дождись окончания подготовки записи.")
+            if self.current is None:
+                raise ValueError("Нет записи для перемотки. Сначала запусти озвучку.")
+            playing = self.state == "playing"
+            # Interrupt the old playback timer as well as the audio stream.
+            self._stop_locked(clear_pending=False)
+            position = self.player.seek(seconds, relative=relative)
+            self.state = "paused"
+            if playing and position < self.player.duration:
+                self.pending.appendleft(self.current)
+                self.condition.notify_all()
+            return position
+
+    def restart(self, *, expected_revision=None):
+        with self.condition:
+            if (
+                self.closed
+                or self.current is None
+                or self.state == "preparing"
+                or (expected_revision is not None and expected_revision != self.cancel_revision)
+            ):
+                return False
+            self._stop_locked()
+            self.player.seek(0)
+            self.pending.append(self.current)
+            self.condition.notify_all()
+            return True
 
     def close(self):
         with self.condition:
@@ -103,6 +162,7 @@ class SpeechService:
                     # playback failure and failed synthesis retain this recording.
                     if path != self.recording.path:
                         self.recording.replace(path, key)
+                    self.current = text, settings
                     duration = self.player.start(path)
                     self.state = "playing"
                 self.notify("Озвучиваю…")
