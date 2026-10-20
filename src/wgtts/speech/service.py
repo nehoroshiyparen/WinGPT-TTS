@@ -1,12 +1,12 @@
 """One cancellable synthesis/playback queue shared by the terminal and widget."""
 
-import re
 from collections import deque
 from copy import deepcopy
 from pathlib import Path
 from threading import Condition, Event, Thread
 
 from wgtts.speech.applio import ApplioClient, Cancelled
+from wgtts.speech.cache import RecordingCache, recording_key
 from wgtts.speech.playback import WavePlayer
 
 
@@ -19,6 +19,7 @@ class SpeechService:
         self.notify = notify
         self.client_factory = client_factory
         self.player = player or WavePlayer(lambda: self.settings.data.get("volume", 100))
+        self.recording = RecordingCache(self.directory, self.notify)
         self.condition = Condition()
         self.pending = deque()
         self.cancel = Event()
@@ -71,18 +72,6 @@ class SpeechService:
             if epoch == self.epoch:
                 self.state = state
 
-    def _remove_audio(self, path):
-        if path is None:
-            return
-        path = Path(path)
-        if not re.fullmatch(r"speech-[0-9a-f]{32}\.wav", path.name):
-            return
-        try:
-            if not path.is_symlink() and path.resolve().parent == self.directory.resolve():
-                path.unlink(missing_ok=True)
-        except OSError as error:
-            self.notify(f"Не удалось убрать временную запись: {error}")
-
     def _run(self):
         while True:
             with self.condition:
@@ -95,15 +84,22 @@ class SpeechService:
                 self.state = "preparing"
             path = None
             try:
-                client = self.client_factory(settings["url"])
-                params = settings["tts"]
-                if not params.get("pthPath") or not params.get("ttsVoice"):
-                    params = {**client.discover(), **params}
-                self.notify("Готовлю озвучку в Applio…")
-                path = client.synthesize(text, params, self.directory, cancel)
+                key = recording_key(text, settings)
+                path = self.recording.find(key)
+                if path is None:
+                    client = self.client_factory(settings["url"])
+                    params = settings["tts"]
+                    if not params.get("pthPath") or not params.get("ttsVoice"):
+                        params = {**client.discover(), **params}
+                    self.notify("Готовлю озвучку в Applio…")
+                    path = client.synthesize(text, params, self.directory, cancel)
                 with self.condition:
                     if cancel.is_set() or epoch != self.epoch:
                         continue
+                    # Publish only a completed, still-current generation. Stop,
+                    # playback failure and failed synthesis retain this recording.
+                    if path != self.recording.path:
+                        self.recording.replace(path, key)
                     duration = self.player.start(path)
                     self.state = "playing"
                 self.notify("Озвучиваю…")
@@ -119,6 +115,6 @@ class SpeechService:
                 if not cancel.is_set():
                     self.notify(f"Ошибка озвучки: {error}")
             finally:
-                # This runs on normal completion, playback failure and Stop,
-                # including a late result from an already cancelled generation.
-                self._remove_audio(path)
+                # Discard a late cancelled result, never the retained recording.
+                if path != self.recording.path:
+                    self.recording.remove(path)
