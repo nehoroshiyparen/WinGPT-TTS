@@ -1,0 +1,53 @@
+#!/bin/sh
+# The application uses Windows UI Automation, including when started from sh.
+set -eu
+
+case $0 in
+    */*) project_dir=${0%/*} ;;
+    *) project_dir=. ;;
+esac
+project_dir=$(CDPATH= cd -P "$project_dir" && pwd)
+launcher="$project_dir/tools/launch.ps1"
+
+if command -v cygpath >/dev/null 2>&1; then
+    launcher=$(cygpath -w "$launcher")
+elif command -v wslpath >/dev/null 2>&1; then
+    launcher=$(wslpath -w "$launcher")
+fi
+
+if ! command -v powershell.exe >/dev/null 2>&1; then
+    printf '%s\n' 'This app needs Windows PowerShell. Run ./wgtts from a Windows shell such as Git Bash.' >&2
+    exit 1
+fi
+
+# Only interactive sessions need a native console. One-shot commands and
+# --plain keep their ordinary output, including when called from a terminal.
+screen_mode=yes
+skip_value=no
+for argument in "$@"; do
+    if [ "$skip_value" = yes ]; then
+        skip_value=no
+        continue
+    fi
+    case $argument in
+        --data-dir|--delay) skip_value=yes ;;
+        --data-dir=*|--delay=*|--no-widget) ;;
+        *) screen_mode=no; break ;;
+    esac
+done
+
+# MinTTY exposes pipes to native Windows programs. Git's winpty gives Python
+# a Windows console, but does not forward alternate-buffer switches itself.
+# Keep an outer alternate screen as well, restoring it on every shell exit.
+if [ "$screen_mode" = yes ] && [ -t 0 ] && [ -t 1 ] && command -v winpty >/dev/null 2>&1; then
+    if ! powershell.exe -NoLogo -NoProfile -Command 'if ([Console]::IsInputRedirected -or [Console]::IsOutputRedirected) { exit 1 }' >/dev/null 2>&1; then
+        printf '\033[?1049h'
+        trap 'printf "\033[?1049l"' 0
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        winpty powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$launcher" "$@"
+        exit $?
+    fi
+fi
+
+exec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$launcher" "$@"

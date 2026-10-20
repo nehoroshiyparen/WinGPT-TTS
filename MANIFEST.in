@@ -1,0 +1,7 @@
+include README.md requirements.txt wgtts wgtts.cmd .gitattributes .editorconfig
+recursive-include docs *.md *.gif *.png *.wav *.mp3 *.mp4
+recursive-include tools *.py *.ps1
+recursive-include tests *.py
+prune data
+prune .venv
+global-exclude __pycache__ *.py[cod]

@@ -1,0 +1,39 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+
+# Local settings, conversation history, generated audio and diagnostics
+/data/
+uia_probe.json
+.env
+.env.*
+!.env.example
+*.log
+
+# Packaging, lint and test output
+/build/
+/dist/
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+tests/**/.*-test-*/
+
+# Local editor and operating system files
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
