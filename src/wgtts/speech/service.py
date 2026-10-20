@@ -5,6 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from threading import Condition, Event, Thread
 
+from wgtts.chat.tables import tables_for_speech
 from wgtts.speech.applio import ApplioClient, Cancelled
 from wgtts.speech.cache import RecordingCache, recording_key
 from wgtts.speech.playback import WavePlayer
@@ -92,7 +93,9 @@ class SpeechService:
                     if not params.get("pthPath") or not params.get("ttsVoice"):
                         params = {**client.discover(), **params}
                     self.notify("Готовлю озвучку в Applio…")
-                    path = client.synthesize(text, params, self.directory, cancel)
+                    path = client.synthesize(
+                        tables_for_speech(text), params, self.directory, cancel
+                    )
                 with self.condition:
                     if cancel.is_set() or epoch != self.epoch:
                         continue

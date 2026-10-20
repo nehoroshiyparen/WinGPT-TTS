@@ -300,6 +300,16 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(service.state, "idle")
         self.assertEqual(self.client.synthesize.call_count, 1)
 
+    def test_applio_receives_labelled_table_rows(self):
+        service = self.service()
+        service.say("До\n| Товар | Цена |\n| --- | --- |\n| Чай | 50 |\nПосле")
+        self.wait_for(lambda: not service.busy)
+        text = self.client.synthesize.call_args.args[0]
+        self.assertIn("Строка 1. Товар: Чай; Цена: 50.", text)
+        self.assertTrue(text.startswith("До\nТаблица."))
+        self.assertTrue(text.endswith("Конец таблицы.\nПосле"))
+        self.assertNotIn("|", text)
+
 
 if __name__ == "__main__":
     unittest.main()

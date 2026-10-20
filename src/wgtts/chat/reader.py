@@ -3,14 +3,18 @@
 import re
 import time
 from dataclasses import dataclass
+from functools import cmp_to_key
 
 from comtypes import COMError
 from pywinauto import Desktop
+from pywinauto.controls.uiawrapper import UIAWrapper
 from pywinauto.findwindows import ElementNotFoundError
 from pywinauto.timings import TimeoutError as UIATimeoutError
 from pywinauto.uia_defines import NoPatternInterfaceError
+from pywinauto.uia_element_info import UIAElementInfo
 
 from wgtts.chat.models import Message, Snapshot
+from wgtts.chat.tables import Table
 
 START, END = 0, 1
 AUTHOR_LABELS = {
@@ -66,10 +70,18 @@ def _before(left, right):
     return left.CompareEndpoints(START, right, START) < 0
 
 
-def _without_controls(span, exclusions):
+def _without_controls(span, exclusions, *, replacements=()):
     cursor = span.Clone()
     chunks = []
-    for exclusion in exclusions:
+    edits = [(exclusion, "") for exclusion in exclusions] + list(replacements)
+
+    def compare(left, right):
+        return left[0].CompareEndpoints(START, right[0], START) or -left[0].CompareEndpoints(
+            END, right[0], END
+        )
+
+    # Table replacements precede any controls or nested tables they contain.
+    for exclusion, replacement in sorted(edits, key=cmp_to_key(compare)):
         if exclusion.CompareEndpoints(END, cursor, START) <= 0:
             continue
         if exclusion.CompareEndpoints(START, span, END) >= 0:
@@ -78,11 +90,116 @@ def _without_controls(span, exclusions):
             prefix = cursor.Clone()
             prefix.MoveEndpointByRange(END, exclusion, START)
             chunks.append(prefix.GetText(-1))
+        chunks.append(replacement)
         cursor.MoveEndpointByRange(START, exclusion, END)
         if cursor.CompareEndpoints(START, span, END) >= 0:
             return "".join(chunks)
     chunks.append(cursor.GetText(-1))
     return "".join(chunks)
+
+
+def _aria_role(node):
+    return node.element_info.element.CurrentAriaRole
+
+
+def _is_table(node):
+    return node.element_info.control_type in {"Table", "DataGrid"} or _aria_role(node) in {
+        "table",
+        "grid",
+    }
+
+
+def _table_cells(table):
+    try:
+        grid = table.iface_grid
+    except NoPatternInterfaceError:
+        grid = None
+    if grid is not None:
+        return [
+            [
+                UIAWrapper(UIAElementInfo(grid.GetItem(row, column)))
+                for column in range(grid.CurrentColumnCount)
+            ]
+            for row in range(grid.CurrentRowCount)
+        ]
+    # Some Chromium versions expose semantic rows without a GridPattern.
+    rows = []
+    for node in table.descendants():
+        if _aria_role(node) == "row":
+            cells = [
+                cell
+                for cell in node.children()
+                if _aria_role(cell) in {"cell", "gridcell", "columnheader", "rowheader"}
+                or cell.element_info.control_type == "HeaderItem"
+            ]
+            if cells:
+                rows.append(cells)
+    return rows
+
+
+def _read_table(table, pattern, exclusions):
+    cells = _table_cells(table)
+    if not cells:
+        return None
+    rows = [
+        [
+            _without_controls(pattern.RangeFromChild(cell.element_info.element), exclusions)
+            .replace("\ufffc", "")
+            .replace("\r\n", "\n")
+            .strip()
+            for cell in row
+        ]
+        for row in cells
+    ]
+    width = max(map(len, rows))
+    for row in rows:
+        row.extend([""] * (width - len(row)))
+    header_count = 0
+    for row in cells:
+        if not any(
+            _aria_role(cell) == "columnheader" or cell.element_info.control_type == "HeaderItem"
+            for cell in row
+        ):
+            break
+        header_count += 1
+    headers = []
+    for column in range(width):
+        labels = list(dict.fromkeys(row[column] for row in rows[:header_count] if row[column]))
+        headers.append(" / ".join(labels) or f"Столбец {column + 1}")
+    return Table(headers, rows[header_count:])
+
+
+def _message_text(span, block, pattern):
+    exclusions = [
+        pattern.RangeFromChild(node.element_info.element)
+        for node in block
+        if node.element_info.control_type == "Button" and node.window_text() in REMOVE_BUTTONS
+    ]
+    replacements = []
+    for node in block:
+        if not _is_table(node):
+            continue
+        table_range = pattern.RangeFromChild(node.element_info.element)
+        # Do not pull a table from the next message or outside a draft's bounds.
+        if (
+            table_range.CompareEndpoints(START, span, START) < 0
+            or table_range.CompareEndpoints(END, span, END) > 0
+            or any(
+                table_range.CompareEndpoints(START, outer, START) >= 0
+                and table_range.CompareEndpoints(END, outer, END) <= 0
+                for outer, _ in replacements
+            )
+        ):
+            continue
+        table = _read_table(node, pattern, exclusions)
+        if table is not None:
+            replacements.append((table_range, "\n\n" + table.markdown() + "\n\n"))
+    return (
+        _without_controls(span, exclusions, replacements=replacements)
+        .replace("\ufffc", "")
+        .replace("\r\n", "\n")
+        .strip()
+    )
 
 
 class ChatReader:
@@ -228,19 +345,7 @@ class ChatReader:
                         and boundary.CompareEndpoints(START, span, END) < 0
                     ):
                         span.MoveEndpointByRange(END, boundary, START)
-            exclusions = []
-            for node in block:
-                if (
-                    node.element_info.control_type == "Button"
-                    and node.window_text() in REMOVE_BUTTONS
-                ):
-                    exclusions.append(pattern.RangeFromChild(node.element_info.element))
-            text = (
-                _without_controls(span, exclusions)
-                .replace("\ufffc", "")
-                .replace("\r\n", "\n")
-                .strip()
-            )
+            text = _message_text(span, block, pattern)
             if text:
                 messages.append(
                     Message(
