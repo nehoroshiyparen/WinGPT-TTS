@@ -495,7 +495,7 @@ class Terminal:
             window = SpeechWidget(
                 self.settings.appearance.image,
                 self.speech,
-                lambda: self.enqueue("start"),
+                lambda: self.submit_command("start"),
                 self.stop,
                 self.done.set,
                 size=self.settings.data["size"],
@@ -507,6 +507,8 @@ class Terminal:
                 on_preset=lambda name: self.enqueue(shlex.join(["preset", name])),
                 on_option=lambda name, value: self.enqueue(shlex.join(["set", name, value])),
                 on_save_preset=lambda name: self.enqueue(shlex.join(["preset", "save", name])),
+                on_seek=self.seek,
+                on_restart=lambda: self.enqueue("restart"),
             )
         self.command_worker = threading.Thread(
             target=self._process_commands, name="commands", daemon=True
