@@ -1,14 +1,18 @@
 """A portrait and its frame form one portable, serializable appearance."""
 
 import re
+from bisect import bisect_right
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
+from io import BytesIO
+from itertools import accumulate
 
-from PIL import Image, ImageColor, ImageDraw, ImageSequence
+from PIL import Image, ImageColor, ImageDraw, ImageOps
 
-from wgtts.paths import image_path, portable_image_path
+from wgtts.paths import ASSETS_DIR, image_path, portable_image_path
 
-DEFAULT_IMAGE = "assets/arthas.gif"
+DEFAULT_IMAGE = "assets/arthas-talk.webp"
+DEFAULT_IDLE = "assets/arthas-idle.webp"
 
 
 @dataclass(frozen=True)
@@ -28,25 +32,54 @@ class Border:
 
 @dataclass(frozen=True)
 class Appearance:
-    image: str = DEFAULT_IMAGE
+    # image remains the talking portrait for callers using the old single-file API.
+    image: str | None = None
     border: Border = Border()
+    idle: str | None = None
+
+    def __post_init__(self):
+        if self.image is None:
+            object.__setattr__(self, "image", DEFAULT_IMAGE)
+            if self.idle is None:
+                object.__setattr__(self, "idle", DEFAULT_IDLE)
+        for path in (self.image, self.idle):
+            if path is not None and (not isinstance(path, str) or not path.strip()):
+                raise ValueError("Укажи путь к GIF, WebP или изображению.")
 
     @classmethod
     def from_dict(cls, value):
         if not isinstance(value, dict):
-            raise ValueError("Оформление должно содержать image и border.")
-        image = value.get("image", DEFAULT_IMAGE)
-        if not isinstance(image, str) or not image.strip():
-            raise ValueError("Укажи путь к GIF или изображению.")
+            raise ValueError("Оформление должно содержать animations и border.")
         border = value.get("border", {})
         if not isinstance(border, dict) or set(border) - {"style", "width", "color"}:
             raise ValueError("Параметры рамки: style, width, color.")
+        if "animations" in value:
+            animations = value["animations"]
+            if (
+                not isinstance(animations, dict)
+                or set(animations) - {"idle", "talk"}
+                or not isinstance(animations.get("talk"), str)
+            ):
+                raise ValueError("Анимации персонажа: idle (ожидание) и talk (разговор).")
+            return cls(animations["talk"], Border(**border), animations.get("idle"))
+        if "image" not in value:
+            return cls(border=Border(**border))
+        image = value["image"]
+        if not isinstance(image, str) or not image.strip():
+            raise ValueError("Укажи путь к GIF, WebP или изображению.")
+        # Upgrade only the old bundled Arthas; keep custom single-file portraits intact.
+        if image_path(image).resolve() == ASSETS_DIR / "arthas.gif":
+            return cls(border=Border(**border))
         return cls(image, Border(**border))
 
     def to_dict(self):
-        value = asdict(self)
-        value["image"] = portable_image_path(self.image)
-        return value
+        return {
+            "animations": {
+                "idle": portable_image_path(self.idle) if self.idle else None,
+                "talk": portable_image_path(self.image),
+            },
+            "border": asdict(self.border),
+        }
 
     @property
     def path(self):
@@ -54,7 +87,11 @@ class Appearance:
 
     def with_option(self, name, raw):
         if name in {"image", "gif"}:
+            return replace(self, image=raw, idle=None)
+        if name == "talk":
             return replace(self, image=raw)
+        if name == "idle":
+            return replace(self, idle=None if raw == "none" else raw)
         field = {"border-width": "width", "border-color": "color", "border-style": "style"}[name]
         value = int(raw) if field == "width" else raw
         changes = {field: value}
@@ -132,37 +169,101 @@ def _frame_overlay(width, height, thickness, border):
     return overlay
 
 
+class Animation:
+    """Keep compressed bytes and one decoder, rather than every decoded frame."""
+
+    def __init__(self, path):
+        # Close the file immediately so users can move/replace their source files.
+        self.source = Image.open(BytesIO(path.read_bytes()))
+        try:
+            self.size = self.source.size
+            self.durations = []
+            for index in range(getattr(self.source, "n_frames", 1)):
+                self.source.seek(index)
+                self.source.load()  # WebP exposes duration only after decoding.
+                self.durations.append(max(20, self.source.info.get("duration", 100)))
+            self.ends = list(accumulate(self.durations))
+            self.source.seek(0)
+        except Exception:
+            self.close()
+            raise
+
+    def __len__(self):
+        return len(self.durations)
+
+    def __getitem__(self, index):
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        self.source.seek(index)
+        return self.source.convert("RGBA")
+
+    def frame_at(self, elapsed):
+        return bisect_right(self.ends, max(0, elapsed) * 1000 % self.ends[-1])
+
+    def close(self):
+        self.source.close()
+
+
 class Portrait:
-    """Owns source animation, geometry and compositing for one appearance."""
+    """Independent character animations share one stable canvas and border."""
 
     def __init__(self, appearance):
         self.appearance = appearance
-        self.frames, self.durations = [], []
-        with Image.open(appearance.path) as source:
-            for frame in ImageSequence.Iterator(source):
-                self.frames.append(frame.convert("RGBA"))
-                self.durations.append(max(20, frame.info.get("duration", 100)))
-        if not self.frames:
-            raise ValueError("В изображении нет кадров.")
-        self.native_size = self.frames[0].size
+        self.animations = {}
+        try:
+            self.animations["talk"] = Animation(appearance.path)
+            if appearance.idle:
+                idle_path = image_path(appearance.idle)
+                self.animations["idle"] = (
+                    self.animations["talk"]
+                    if idle_path == appearance.path
+                    else Animation(idle_path)
+                )
+        except Exception:
+            self.close()
+            raise
+        self.frames = self.animations["talk"]
+        self.durations = self.frames.durations
+        self.native_size = self.frames.size
+        # Higher quality assets must not suddenly make the desktop widget enormous.
+        ratio = min(1, 231 / max(self.native_size))
+        self.base_size = tuple(max(1, round(length * ratio)) for length in self.native_size)
+
+    def close(self):
+        for animation in set(self.animations.values()):
+            animation.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def frame_at(self, elapsed, state="talk"):
+        if state == "idle" and "idle" not in self.animations:
+            return 0
+        return self.animations[state].frame_at(elapsed)
 
     def content_box(self, size):
         border = self.appearance.border
         inset = round(border.width * size / 100) if border.style != "none" else 0
-        width, height = (max(1, round(length * size / 100)) for length in self.native_size)
+        width, height = (max(1, round(length * size / 100)) for length in self.base_size)
         return inset, inset, inset + width, inset + height
 
     def canvas_size(self, size):
         left, top, right, bottom = self.content_box(size)
         return right + left, bottom + top
 
-    def render(self, index, size):
+    def render(self, index, size, state="talk"):
         left, top, right, bottom = self.content_box(size)
         width, height = self.canvas_size(size)
-        frame = self.frames[index]
-        if frame.size != (right - left, bottom - top):
-            frame = frame.resize((right - left, bottom - top), Image.Resampling.LANCZOS)
+        animation = self.animations.get(state, self.frames)
+        frame = animation[index]
+        frame = ImageOps.contain(frame, (right - left, bottom - top), Image.Resampling.LANCZOS)
         result = Image.new("RGBA", (width, height), "#11151d")
-        result.alpha_composite(frame, (left, top))
+        result.alpha_composite(
+            frame,
+            (left + (right - left - frame.width) // 2, top + (bottom - top - frame.height) // 2),
+        )
         result.alpha_composite(_frame_overlay(width, height, left, self.appearance.border))
         return result

@@ -12,9 +12,14 @@ from wgtts.ui.portrait import Appearance, Portrait
 class ResourcePathTests(unittest.TestCase):
     def test_default_portrait_renders_and_keeps_its_portable_name(self):
         appearance = Appearance()
-        self.assertEqual(appearance.path, ASSETS_DIR / "arthas.gif")
-        self.assertEqual(appearance.to_dict()["image"], "assets/arthas.gif")
-        self.assertGreater(len(Portrait(appearance).frames), 1)
+        self.assertEqual(appearance.path, ASSETS_DIR / "arthas-talk.webp")
+        self.assertEqual(
+            appearance.to_dict()["animations"],
+            {"idle": "assets/arthas-idle.webp", "talk": "assets/arthas-talk.webp"},
+        )
+        with Portrait(appearance) as portrait:
+            self.assertGreater(len(portrait.animations["talk"]), 1)
+            self.assertGreater(len(portrait.animations["idle"]), 1)
 
     def test_old_absolute_assets_path_resolves_to_the_bundled_portrait(self):
         with tempfile.TemporaryDirectory() as directory:

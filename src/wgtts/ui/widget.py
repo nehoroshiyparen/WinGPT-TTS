@@ -3,6 +3,7 @@
 import sys
 import time
 import tkinter as tk
+from collections import OrderedDict
 from tkinter import colorchooser, filedialog, simpledialog
 
 from PIL import Image, ImageTk
@@ -80,6 +81,8 @@ def _work_area(root):
 
 
 class SpeechWidget:
+    FRAME_CACHE_SIZE = 8
+
     def __init__(
         self,
         gif,
@@ -122,9 +125,10 @@ class SpeechWidget:
         self.root.configure(bg="#11151d", bd=0)
         self.root.protocol("WM_DELETE_WINDOW", on_close)
         self.portrait = Portrait(appearance or Appearance(image=str(gif)))
-        self.durations = self.portrait.durations
         self.width, self.height = self.portrait.canvas_size(self.size)
-        self.frames = [None] * len(self.portrait.frames)
+        self.frames = OrderedDict()
+        self.animation_state = "talk" if speech.state == "playing" else "idle"
+        self.animation_started = time.monotonic()
         self._update_app_icon()
         self.displayed_frame = 0
         self.canvas = tk.Canvas(
@@ -176,23 +180,31 @@ class SpeechWidget:
             surface.bind("<MouseWheel>", self._wheel)
             surface.bind("<Button-3>", self._show_menu)
         self.root.bind("<Configure>", self._root_configured)
+        self.root.bind("<Destroy>", self._destroy)
         self.root.bind("<Alt-F4>", lambda event: on_close())
         self.dock.bind("<Alt-F4>", lambda event: on_close())
         self.menu = tk.Menu(self.root, tearoff=False)
         self.menu.add_command(label="Закрыть", command=on_close)
         self.index = 0
-        self.next_frame = 0
         self.last_state = None
         self.root.update_idletasks()
         _windows_taskbar(self.dock, secondary=True)
         self.root.after(30, self._tick)
 
     def _frame(self, index):
-        if self.frames[index] is None:
-            self.frames[index] = ImageTk.PhotoImage(
-                self.portrait.render(index, self.size), master=self.root
+        key = self.animation_state, index
+        if key not in self.frames:
+            self.frames[key] = ImageTk.PhotoImage(
+                self.portrait.render(index, self.size, self.animation_state), master=self.root
             )
-        return self.frames[index]
+        self.frames.move_to_end(key)
+        while len(self.frames) > self.FRAME_CACHE_SIZE:
+            self.frames.popitem(last=False)
+        return self.frames[key]
+
+    def _destroy(self, event):
+        if event.widget is self.root:
+            self.portrait.close()
 
     def _update_app_icon(self):
         # The taskbar uses the same portrait and frame as the widget.
@@ -281,10 +293,17 @@ class SpeechWidget:
     def set_appearance(self, appearance):
         if self.portrait.appearance == appearance:
             return
-        self.portrait = Portrait(appearance)
-        self.durations = self.portrait.durations
+        previous = self.portrait
+        if (previous.appearance.image, previous.appearance.idle) == (
+            appearance.image,
+            appearance.idle,
+        ):
+            previous.appearance = appearance
+        else:
+            self.portrait = Portrait(appearance)
+            previous.close()
         self.index = self.displayed_frame = 0
-        self.next_frame = 0
+        self.animation_started = time.monotonic()
         self._update_app_icon()
         self._refresh_geometry()
 
@@ -301,9 +320,8 @@ class SpeechWidget:
         self.pressed_action = self.seek_preview = self.hovered_action = None
         self.scrubbing = False
         self.width, self.height = self.portrait.canvas_size(self.size)
-        # Resize original pixels on demand; repeated zooming does not accumulate
-        # blur or create all 83 Tk images on every wheel event.
-        self.frames = [None] * len(self.portrait.frames)
+        # Keep only a few scaled images, regardless of animation length or zoom.
+        self.frames.clear()
         self.canvas.configure(width=self.width, height=self.height)
         self.canvas.itemconfigure(self.picture, image=self._frame(self.displayed_frame))
         self._layout_transport()
@@ -364,7 +382,12 @@ class SpeechWidget:
                 )
             self.menu.add_cascade(label="Оформление", menu=appearances)
         if self.on_option:
-            self.menu.add_command(label="Выбрать портрет…", command=self._choose_image)
+            animations = tk.Menu(self.menu, tearoff=False)
+            animations.add_command(label="Ожидание…", command=lambda: self._choose_image("idle"))
+            animations.add_command(label="Разговор…", command=lambda: self._choose_image("talk"))
+            animations.add_separator()
+            animations.add_command(label="Один портрет…", command=self._choose_image)
+            self.menu.add_cascade(label="Анимации персонажа", menu=animations)
             self.menu.add_command(label="Цвет рамки…", command=self._choose_color)
             widths = tk.Menu(self.menu, tearoff=False)
             self.border_width_choice = tk.IntVar(
@@ -388,17 +411,18 @@ class SpeechWidget:
         finally:
             self.menu.grab_release()
 
-    def _choose_image(self):
+    def _choose_image(self, state="image"):
+        title = {"idle": "Анимация ожидания", "talk": "Анимация разговора", "image": "Один портрет"}
         path = filedialog.askopenfilename(
             parent=self.root,
-            title=f"Портрет {APP_NAME}",
+            title=title[state],
             filetypes=[
                 ("Изображения", "*.gif *.png *.jpg *.jpeg *.webp *.bmp"),
                 ("Все файлы", "*.*"),
             ],
         )
         if path:
-            self.on_option("image", path)
+            self.on_option(state, path)
 
     def _choose_color(self):
         _, color = colorchooser.askcolor(
@@ -545,16 +569,17 @@ class SpeechWidget:
             self._update_control()
             self.last_state = state
         self._update_transport()
-        if state == "playing":
-            if now >= self.next_frame:
-                self.canvas.itemconfigure(self.picture, image=self._frame(self.index))
-                self.displayed_frame = self.index
-                self.next_frame = now + self.durations[self.index] / 1000
-                self.index = (self.index + 1) % len(self.frames)
-        else:
-            self.index = 0
-            self.next_frame = 0
-            if self.displayed_frame != 0:
-                self.canvas.itemconfigure(self.picture, image=self._frame(0))
-                self.displayed_frame = 0
-        self.root.after(20, self._tick)
+        self._animate(state, now)
+        self.root.after(10, self._tick)
+
+    def _animate(self, speech_state, now):
+        state = "talk" if speech_state == "playing" else "idle"
+        if self.animation_state != state:
+            self.animation_state = state
+            self.animation_started = now
+            self.displayed_frame = -1
+        # Use elapsed time so decoding, resizing or dragging cannot slow the clip.
+        self.index = self.portrait.frame_at(now - self.animation_started, state)
+        if self.displayed_frame != self.index:
+            self.canvas.itemconfigure(self.picture, image=self._frame(self.index))
+            self.displayed_frame = self.index

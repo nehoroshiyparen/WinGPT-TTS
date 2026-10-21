@@ -1,6 +1,7 @@
 """Transport gestures must seek audio without dragging the portrait window."""
 
 import unittest
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -203,6 +204,45 @@ class TransportLayoutTests(unittest.TestCase):
                 self.assertGreaterEqual(layout.width, 160)
                 self.assertGreaterEqual(layout.diameter("play"), 28)
                 self.assertGreaterEqual(layout.diameter("back"), 20)
+
+
+class WidgetAnimationTests(unittest.TestCase):
+    def setUp(self):
+        self.widget = SpeechWidget.__new__(SpeechWidget)
+        w = self.widget
+        w.portrait, w.canvas, w.root = Mock(), Mock(), Mock()
+        w.frames = OrderedDict()
+        w.size, w.picture, w.displayed_frame = 100, 1, 0
+        w.animation_state, w.animation_started = "idle", 10.0
+        w.portrait.frame_at.return_value = 0
+
+    def test_speech_switches_files_and_pause_preparation_error_animate_idle(self):
+        w = self.widget
+        w._frame = Mock()
+        w.portrait.frame_at.return_value = 3
+        w._animate("idle", 10.1)
+        w.portrait.frame_at.assert_called_with(unittest.mock.ANY, "idle")
+        w._frame.assert_called_with(3)
+        w.portrait.frame_at.return_value = 0
+        w._animate("playing", 10.2)
+        self.assertEqual(w.animation_state, "talk")
+        w.portrait.frame_at.assert_called_with(0, "talk")
+        for state in ("paused", "preparing", "error", "idle"):
+            w._animate(state, 10.3)
+            self.assertEqual(w.animation_state, "idle")
+        # Changes among silent speech states do not restart the waiting animation.
+        self.assertEqual(w.animation_started, 10.3)
+
+    def test_scaled_frame_cache_is_bounded_and_distinguishes_states(self):
+        w = self.widget
+        with patch("wgtts.ui.widget.ImageTk.PhotoImage", side_effect=lambda *a, **kw: object()):
+            first_idle = w._frame(0)
+            w.animation_state = "talk"
+            self.assertIsNot(w._frame(0), first_idle)
+            for frame in range(30):
+                w._frame(frame)
+            self.assertEqual(len(w.frames), w.FRAME_CACHE_SIZE)
+            self.assertIn(("talk", 29), w.frames)
 
 
 if __name__ == "__main__":

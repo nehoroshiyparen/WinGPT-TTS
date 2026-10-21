@@ -44,7 +44,7 @@ class Settings:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
             # Old installations stored the GIF separately; retain their portrait.
             if "portrait" not in loaded and loaded.get("gif"):
-                loaded["portrait"] = Appearance(image=loaded["gif"]).to_dict()
+                loaded["portrait"] = Appearance.from_dict({"image": loaded["gif"]}).to_dict()
             loaded.pop("gif", None)
             self.data.update(loaded)
         self.data["portrait"] = Appearance.from_dict(self.data["portrait"]).to_dict()
@@ -65,7 +65,8 @@ class Settings:
         if name not in presets:
             raise ValueError("Неизвестный пресет. Доступны: " + ", ".join(presets))
         appearance = presets[name][1]
-        Portrait(appearance)  # Decode before saving, so a bad file cannot break the widget.
+        with Portrait(appearance):  # Decode both files before committing a preset.
+            pass
         self.data["portrait"] = appearance.to_dict()
         self.save()
 
@@ -84,10 +85,19 @@ class Settings:
         os.replace(temporary, self.path)
 
     def set(self, name, raw):
-        if name in {"image", "gif", "border-width", "border-color", "border-style"}:
+        if name in {
+            "image",
+            "gif",
+            "idle",
+            "talk",
+            "border-width",
+            "border-color",
+            "border-style",
+        }:
             appearance = self.appearance.with_option(name, raw)
-            if name in {"image", "gif"}:
-                Portrait(appearance)
+            if name in {"image", "gif", "idle", "talk"}:
+                with Portrait(appearance):
+                    pass
             self.data["portrait"] = appearance.to_dict()
             self.save()
             return raw
@@ -120,7 +130,7 @@ class Settings:
             value = raw
         else:
             raise ValueError(
-                "Настройки: volume, size, image, border-width, border-color, border-style, delay, poll, stable, rate, pitch, voice, model, index, url."
+                "Настройки: volume, size, idle, talk, image, border-width, border-color, border-style, delay, poll, stable, rate, pitch, voice, model, index, url."
             )
         if name in aliases:
             self.data["tts"][aliases[name]] = value

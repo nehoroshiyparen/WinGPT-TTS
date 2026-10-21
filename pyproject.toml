@@ -37,7 +37,7 @@ include = ["wgtts*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-wgtts = ["assets/*.gif", "assets/*.png", "assets/*.ico"]
+wgtts = ["assets/*.gif", "assets/*.webp", "assets/*.png", "assets/*.ico"]
 
 [tool.ruff]
 target-version = "py311"

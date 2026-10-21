@@ -37,10 +37,12 @@ HELP = """Команды:
   set voice ИМЯ     голос Edge TTS, например ru-RU-SvetlanaNeural
   set poll 1.5      частота проверки новых ответов, секунды
   set size 150      размер виджета в процентах (50–300); также колёсиком над GIF
-  preset            список оформлений (портрет вместе с рамкой)
+  preset            список оформлений (анимации персонажа и рамка)
   preset classic    применить оформление: classic, frost, minimal, bare
-  preset save ИМЯ   сохранить текущий портрет и рамку как свой пресет
-  set image ПУТЬ    другой GIF или статичный портрет
+  preset save ИМЯ   сохранить обе анимации и рамку как свой пресет
+  set idle ПУТЬ     анимация ожидания (GIF / WebP) или статичная картинка
+  set talk ПУТЬ     анимация разговора (GIF / WebP) или статичная картинка
+  set image ПУТЬ    один портрет: анимация при речи, первый кадр в ожидании
   set border-width 9        толщина рамки при 100% (0–30)
   set border-color "#92999c" цвет рамки
   set border-style bevel   стиль: bevel, flat, none
@@ -399,7 +401,7 @@ class Terminal:
                 self.write(f"Оформление {args[0]} применено.")
             elif len(args) == 2 and args[0] == "save":
                 self.settings.save_preset(args[1])
-                self.write(f"Портрет и рамка сохранены: {args[1]}.")
+                self.write(f"Анимации персонажа и рамка сохранены: {args[1]}.")
             else:
                 raise ValueError("Используй: preset, preset ИМЯ или preset save ИМЯ")
         elif name == "set":
@@ -410,7 +412,15 @@ class Terminal:
                 "size": "Размер виджета изменён.",
                 "volume": "Громкость изменена.",
                 **dict.fromkeys(
-                    ("image", "gif", "border-width", "border-color", "border-style"),
+                    (
+                        "image",
+                        "gif",
+                        "idle",
+                        "talk",
+                        "border-width",
+                        "border-color",
+                        "border-style",
+                    ),
                     "Оформление виджета изменено.",
                 ),
             }.get(args[0], "Применится к следующим задачам.")
