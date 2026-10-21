@@ -5,7 +5,7 @@ from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from wgtts.ui.transport import TransportLayout, TransportPanel, dock_position
+from wgtts.ui.transport import DrawerMotion, TransportLayout, TransportPanel
 from wgtts.ui.widget import SpeechWidget
 
 
@@ -14,7 +14,6 @@ class WidgetTransportTests(unittest.TestCase):
         self.widget = SpeechWidget.__new__(SpeechWidget)
         widget = self.widget
         widget.canvas, widget.root, widget.portrait = Mock(), Mock(), Mock()
-        widget.dock, widget.dock_canvas = Mock(), Mock()
         widget.root.winfo_x.return_value = widget.root.winfo_y.return_value = 0
         widget.width, widget.height = 249, 221
         widget.portrait.content_box.return_value = (9, 9, 240, 212)
@@ -26,9 +25,14 @@ class WidgetTransportTests(unittest.TestCase):
             enabled=TransportPanel.enabled,
             update=Mock(),
         )
-        widget.transport_canvas = widget.dock_canvas
-        widget._position_dock = Mock()
-        widget.dock.winfo_ismapped.return_value = True
+        widget.transport_canvas = widget.canvas
+        widget.drawer = DrawerMotion(value=1, target=1, origin=1)
+        widget.drawer_pixels = widget.panel.layout.height
+        widget.drawer_above = False
+        widget.panel_y = widget.height
+        widget._apply_drawer = Mock()
+        widget._choose_direction = Mock()
+        widget._position_card = Mock()
         widget.hovering = True
         widget.dragging = widget.scrubbing = False
         widget.pressed_action = widget.seek_preview = widget.drag_origin = None
@@ -38,7 +42,7 @@ class WidgetTransportTests(unittest.TestCase):
     def event(self, x, y, *, surface=None):
         return SimpleNamespace(
             x=x,
-            y=y,
+            y=y + self.widget.panel_y if surface is None else y,
             x_root=x + 50,
             y_root=y + 50,
             widget=surface if surface is not None else self.widget.transport_canvas,
@@ -125,16 +129,15 @@ class WidgetTransportTests(unittest.TestCase):
         widget.on_seek.assert_not_called()
         widget.root.geometry.assert_not_called()
 
-    def test_detached_panel_uses_its_own_coordinates_and_hover_transition(self):
+    def test_panel_coordinates_are_translated_and_portrait_still_drags(self):
         widget = self.widget
         widget.panel.layout = TransportLayout.for_portrait((4, 4, 120, 106))
-        widget.transport_canvas = widget.dock_canvas
         widget._update_transport = Mock()
         event = self.event(*widget.panel.layout.centers["forward"])
         widget._press(event)
         widget._release(event)
         widget.on_seek.assert_called_once_with(10, relative=True)
-        portrait_event = self.event(event.x, event.y, surface=widget.canvas)
+        portrait_event = self.event(20, 20, surface=widget.canvas)
         self.assertIsNone(widget._transport_action(portrait_event))
         widget._leave(portrait_event)
         self.assertTrue(widget.hovering)
@@ -148,7 +151,8 @@ class WidgetTransportTests(unittest.TestCase):
         widget._press(event)
         with patch("wgtts.ui.widget.sys.platform", "linux"):
             widget._drag(self.event(40, 50, surface=widget.canvas))
-        widget.root.geometry.assert_called_once_with("+20+30")
+        self.assertEqual((widget.anchor_x, widget.anchor_y), (20, 30))
+        widget._position_card.assert_called()
         widget.on_start.assert_not_called()
         widget.on_seek.assert_not_called()
 
@@ -161,15 +165,6 @@ class WidgetTransportTests(unittest.TestCase):
 
 
 class TransportLayoutTests(unittest.TestCase):
-    def test_detached_panel_stays_on_its_monitor_and_avoids_bottom_edge(self):
-        self.assertEqual(
-            dock_position((100, 100, 124, 110, 196, 78), (0, 0, 1920, 1040)), (64, 216)
-        )
-        self.assertEqual(dock_position((0, 900, 124, 110, 196, 78), (0, 0, 1920, 1040)), (0, 816))
-        self.assertEqual(
-            dock_position((-1600, 100, 124, 110, 196, 78), (-1600, 0, 0, 1040)), (-1600, 216)
-        )
-
     def test_controls_are_centered_symmetric_and_scale_with_portrait(self):
         normal = TransportLayout.for_portrait((9, 9, 240, 212))
         large = TransportLayout.for_portrait((27, 27, 720, 636))
@@ -182,28 +177,38 @@ class TransportLayoutTests(unittest.TestCase):
                 self.assertEqual(layout.hit(x + radius - 1, y), action)
                 self.assertGreaterEqual(x - radius, layout.x)
                 self.assertLessEqual(x + radius, layout.x + layout.width)
-        self.assertGreater(large.diameter("play"), normal.diameter("play"))
-        self.assertLess(normal.height, 75)
-        self.assertLess(normal.width, 175)
+        self.assertEqual(large.diameter("play"), normal.diameter("play"))
+        self.assertLessEqual(normal.height, 70)
+        self.assertEqual(normal.width, 231)
 
     def test_large_portraits_do_not_make_player_grow_past_its_limit(self):
         capped = TransportLayout.for_portrait((0, 0, 346, 304))
         for box in ((0, 0, 693, 609), (0, 0, 1386, 1218), (0, 0, 5000, 5000)):
             with self.subTest(box=box):
                 layout = TransportLayout.for_portrait(box)
-                self.assertEqual((layout.width, layout.height), (capped.width, capped.height))
-                self.assertLessEqual(layout.width, 215)
-                self.assertLessEqual(layout.height, 92)
-                self.assertLessEqual(layout.diameter("play"), 40)
-                self.assertLessEqual(layout.diameter("back"), 30)
+                self.assertEqual(layout.height, capped.height)
+                self.assertEqual(layout.width, box[2])
+                self.assertLessEqual(layout.height, 70)
+                self.assertLessEqual(layout.diameter("play"), 36)
+                self.assertLessEqual(layout.diameter("back"), 28)
 
-    def test_small_portraits_get_a_readable_detached_panel(self):
+    def test_small_portraits_keep_compact_controls_within_their_width(self):
         for box in ((4, 4, 120, 106), (7, 7, 192, 169), (0, 0, 500, 100)):
             with self.subTest(box=box):
                 layout = TransportLayout.for_portrait(box)
-                self.assertGreaterEqual(layout.width, 160)
-                self.assertGreaterEqual(layout.diameter("play"), 28)
+                self.assertEqual(layout.width, box[2] - box[0])
+                self.assertGreaterEqual(layout.diameter("play"), 27)
                 self.assertGreaterEqual(layout.diameter("back"), 20)
+
+    def test_drawer_reverses_midway_without_jumping_and_finishes_exactly(self):
+        motion = DrawerMotion()
+        motion.to(1, 10)
+        middle = motion.at(10.08)
+        self.assertGreater(middle, 0)
+        self.assertLess(middle, 1)
+        motion.to(0, 10.08)
+        self.assertEqual(motion.at(10.08), middle)
+        self.assertEqual(motion.at(11), 0)
 
 
 class WidgetAnimationTests(unittest.TestCase):

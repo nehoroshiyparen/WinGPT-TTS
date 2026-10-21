@@ -90,6 +90,7 @@ class Settings:
             "gif",
             "idle",
             "talk",
+            "character-name",
             "border-width",
             "border-color",
             "border-style",
@@ -130,7 +131,7 @@ class Settings:
             value = raw
         else:
             raise ValueError(
-                "Настройки: volume, size, idle, talk, image, border-width, border-color, border-style, delay, poll, stable, rate, pitch, voice, model, index, url."
+                "Настройки: volume, size, idle, talk, image, character-name, border-width, border-color, border-style, delay, poll, stable, rate, pitch, voice, model, index, url."
             )
         if name in aliases:
             self.data["tts"][aliases[name]] = value

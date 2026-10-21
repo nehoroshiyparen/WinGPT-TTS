@@ -38,14 +38,15 @@ HELP = """Команды:
   set poll 1.5      частота проверки новых ответов, секунды
   set size 150      размер виджета в процентах (50–300); также колёсиком над GIF
   preset            список оформлений (анимации персонажа и рамка)
-  preset classic    применить оформление: classic, frost, minimal, bare
+  preset modern     применить оформление: modern, classic, frost, minimal, bare
   preset save ИМЯ   сохранить обе анимации и рамку как свой пресет
   set idle ПУТЬ     анимация ожидания (GIF / WebP) или статичная картинка
   set talk ПУТЬ     анимация разговора (GIF / WebP) или статичная картинка
+  set character-name ИМЯ   имя персонажа в плеере
   set image ПУТЬ    один портрет: анимация при речи, первый кадр в ожидании
   set border-width 9        толщина рамки при 100% (0–30)
   set border-color "#92999c" цвет рамки
-  set border-style bevel   стиль: bevel, flat, none
+  set border-style card    стиль: card, bevel, flat, none
   help / quit       справка / выход
 
 При scan чат прокручивается автоматически. Подожди окончания прохода.
@@ -417,6 +418,7 @@ class Terminal:
                         "gif",
                         "idle",
                         "talk",
+                        "character-name",
                         "border-width",
                         "border-color",
                         "border-style",

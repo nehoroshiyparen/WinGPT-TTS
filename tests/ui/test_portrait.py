@@ -129,12 +129,14 @@ class AppearanceTests(unittest.TestCase):
         settings.set("idle", str(idle))
         settings.set("talk", str(talk))
         settings.set("border-color", "#abcdef")
+        settings.set("character-name", "Сильвана")
         expected = settings.appearance
         settings.save_preset("Другой персонаж")
         settings.apply_preset("classic")
         settings = Settings(self.path)
         settings.apply_preset("Другой персонаж")
         self.assertEqual(Settings(self.path).appearance, expected)
+        self.assertEqual(expected.character_name, "Сильвана")
         with Portrait(expected) as portrait:
             self.assertEqual(portrait.animations["idle"].durations, [40, 60])
             self.assertEqual(portrait.animations["talk"].durations, [80, 120])

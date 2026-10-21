@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from io import BytesIO
 from itertools import accumulate
+from pathlib import Path
 
 from PIL import Image, ImageColor, ImageDraw, ImageOps
 
@@ -22,8 +23,8 @@ class Border:
     color: str = "#92999c"
 
     def __post_init__(self):
-        if self.style not in {"bevel", "flat", "none"}:
-            raise ValueError("Стиль рамки: bevel, flat или none.")
+        if self.style not in {"card", "bevel", "flat", "none"}:
+            raise ValueError("Стиль рамки: card, bevel, flat или none.")
         if type(self.width) is not int or not 0 <= self.width <= 30:
             raise ValueError("Толщина рамки: целое число от 0 до 30.")
         if not isinstance(self.color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", self.color):
@@ -34,8 +35,9 @@ class Border:
 class Appearance:
     # image remains the talking portrait for callers using the old single-file API.
     image: str | None = None
-    border: Border = Border()
+    border: Border = Border("card", 0, "#383f49")
     idle: str | None = None
+    name: str = ""
 
     def __post_init__(self):
         if self.image is None:
@@ -45,12 +47,14 @@ class Appearance:
         for path in (self.image, self.idle):
             if path is not None and (not isinstance(path, str) or not path.strip()):
                 raise ValueError("Укажи путь к GIF, WebP или изображению.")
+        if not isinstance(self.name, str) or len(self.name) > 60:
+            raise ValueError("Имя персонажа: не более 60 символов.")
 
     @classmethod
     def from_dict(cls, value):
         if not isinstance(value, dict):
             raise ValueError("Оформление должно содержать animations и border.")
-        border = value.get("border", {})
+        border = value.get("border", asdict(cls().border))
         if not isinstance(border, dict) or set(border) - {"style", "width", "color"}:
             raise ValueError("Параметры рамки: style, width, color.")
         if "animations" in value:
@@ -61,7 +65,9 @@ class Appearance:
                 or not isinstance(animations.get("talk"), str)
             ):
                 raise ValueError("Анимации персонажа: idle (ожидание) и talk (разговор).")
-            return cls(animations["talk"], Border(**border), animations.get("idle"))
+            return cls(
+                animations["talk"], Border(**border), animations.get("idle"), value.get("name", "")
+            )
         if "image" not in value:
             return cls(border=Border(**border))
         image = value["image"]
@@ -74,6 +80,7 @@ class Appearance:
 
     def to_dict(self):
         return {
+            "name": self.name,
             "animations": {
                 "idle": portable_image_path(self.idle) if self.idle else None,
                 "talk": portable_image_path(self.image),
@@ -85,6 +92,17 @@ class Appearance:
     def path(self):
         return image_path(self.image)
 
+    @property
+    def character_name(self):
+        if self.name.strip():
+            return self.name.strip()
+        if self.path == ASSETS_DIR / "arthas-talk.webp":
+            return "Артас"
+        return (
+            re.sub(r"[-_ ](?:talk|idle|afk|portrait)$", "", Path(self.image).stem, flags=re.I)
+            or "Персонаж"
+        )
+
     def with_option(self, name, raw):
         if name in {"image", "gif"}:
             return replace(self, image=raw, idle=None)
@@ -92,17 +110,20 @@ class Appearance:
             return replace(self, image=raw)
         if name == "idle":
             return replace(self, idle=None if raw == "none" else raw)
+        if name == "character-name":
+            return replace(self, name=raw.strip())
         field = {"border-width": "width", "border-color": "color", "border-style": "style"}[name]
         value = int(raw) if field == "width" else raw
         changes = {field: value}
-        if field == "width" and value > 0 and self.border.style == "none":
+        if field == "width" and value > 0 and self.border.style in {"none", "card"}:
             changes["style"] = "bevel"
         return replace(self, border=replace(self.border, **changes))
 
 
 # Each preset carries both the image and the border, including user-saved ones.
 PRESETS = {
-    "classic": ("Классическая сталь", Appearance()),
+    "modern": ("Современная карточка", Appearance()),
+    "classic": ("Классическая сталь", Appearance(border=Border())),
     "frost": ("Ледяная сталь", Appearance(border=Border(color="#7196ad"))),
     "minimal": ("Тонкая рамка", Appearance(border=Border("flat", 2, "#67747c"))),
     "bare": ("Без рамки", Appearance(border=Border("none", 0))),
@@ -246,7 +267,7 @@ class Portrait:
 
     def content_box(self, size):
         border = self.appearance.border
-        inset = round(border.width * size / 100) if border.style != "none" else 0
+        inset = round(border.width * size / 100) if border.style not in {"none", "card"} else 0
         width, height = (max(1, round(length * size / 100)) for length in self.base_size)
         return inset, inset, inset + width, inset + height
 

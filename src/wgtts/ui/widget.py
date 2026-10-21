@@ -11,7 +11,30 @@ from PIL import Image, ImageTk
 from wgtts.branding import APP_ID, APP_NAME
 from wgtts.speech.playback import format_time
 from wgtts.ui.portrait import Appearance, Portrait
-from wgtts.ui.transport import TransportLayout, TransportPanel, dock_position
+from wgtts.ui.transport import PANEL_BACKGROUND, DrawerMotion, TransportLayout, TransportPanel
+
+
+def _round_window(root, width, height, radius):
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    gdi32, user32 = ctypes.windll.gdi32, ctypes.windll.user32
+    gdi32.CreateRoundRectRgn.argtypes = [ctypes.c_int] * 6
+    gdi32.CreateRoundRectRgn.restype = wintypes.HANDLE
+    user32.SetWindowRgn.argtypes = [wintypes.HWND, wintypes.HANDLE, wintypes.BOOL]
+    user32.SetWindowRgn.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    handle = user32.GetParent(root.winfo_id()) or root.winfo_id()
+    region = (
+        gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, radius * 2, radius * 2)
+        if radius
+        else None
+    )
+    if not user32.SetWindowRgn(handle, region, True) and region:
+        gdi32.DeleteObject(region)
 
 
 def _windows_app_identity():
@@ -21,8 +44,8 @@ def _windows_app_identity():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
 
 
-def _windows_taskbar(root, *, secondary=False):
-    """Give the portrait a taskbar icon; keep its secondary panel unfocused."""
+def _windows_taskbar(root):
+    """Keep the frameless character card visible in the Windows taskbar."""
     if sys.platform != "win32":
         return
     import ctypes
@@ -47,9 +70,7 @@ def _windows_taskbar(root, *, secondary=False):
     user32.SetWindowPos.restype = wintypes.BOOL
     handle = user32.GetParent(root.winfo_id()) or root.winfo_id()
     style = user32.GetWindowLongW(handle, -20)
-    style = (
-        ((style | 0x08000080) & ~0x00040000) if secondary else ((style | 0x00040000) & ~0x00000080)
-    )
+    style = (style | 0x00040000) & ~0x00000080
     user32.SetWindowLongW(handle, -20, style)
     user32.SetWindowPos(handle, None, 0, 0, 0, 0, 0x0020 | 0x0010 | 0x0004 | 0x0002 | 0x0001)
 
@@ -122,7 +143,7 @@ class SpeechWidget:
         self.root.overrideredirect(True)
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
-        self.root.configure(bg="#11151d", bd=0)
+        self.root.configure(bg=PANEL_BACKGROUND, bd=0)
         self.root.protocol("WM_DELETE_WINDOW", on_close)
         self.portrait = Portrait(appearance or Appearance(image=str(gif)))
         self.width, self.height = self.portrait.canvas_size(self.size)
@@ -137,7 +158,7 @@ class SpeechWidget:
             height=self.height,
             bd=0,
             highlightthickness=0,
-            bg="#11151d",
+            bg=PANEL_BACKGROUND,
         )
         self.canvas.pack()
         self.picture = self.canvas.create_image(0, 0, image=self._frame(0), anchor="nw")
@@ -150,27 +171,20 @@ class SpeechWidget:
         self.scrubbing = False
         self.seek_preview = None
         self.seek_duration = 0
-        # On Windows, creating a transient while its owner is withdrawn can leave
-        # it permanently unmapped (1x1), even after repeated deiconify calls.
-        # Finish mapping the portrait before creating its playback panel.
+        self.drawer = DrawerMotion()
+        self.drawer_pixels = 0
+        self.drawer_above = False
+        self.panel_y = 0
+        self.window_bounds = None
+        self.window_shape = None
+        self.drawer_layout = None
         _windows_taskbar(self.root)
         self.root.deiconify()
         self.root.update_idletasks()
-        self.dock = tk.Toplevel(self.root)
-        self.dock.withdraw()
-        self.dock.title(APP_NAME + " · управление")
-        self.dock.overrideredirect(True)
-        self.dock.attributes("-topmost", True)
-        self.dock.transient(self.root)
-        self.dock.configure(bg="#11151d")
-        if sys.platform == "win32":
-            self.dock.attributes("-toolwindow", True)
-        self.dock_canvas = tk.Canvas(self.dock, bd=0, highlightthickness=0, bg="#11151d")
-        self.dock_canvas.pack()
+        self.anchor_x, self.anchor_y = self.root.winfo_rootx(), self.root.winfo_rooty()
         self.panel = None
-        self.dock_anchor = None
         self._layout_transport()
-        for surface in (self.canvas, self.dock_canvas):
+        for surface in (self.canvas,):
             surface.bind("<Enter>", self._enter)
             surface.bind("<Leave>", self._leave)
             surface.bind("<Motion>", self._motion)
@@ -179,17 +193,22 @@ class SpeechWidget:
             surface.bind("<ButtonRelease-1>", self._release)
             surface.bind("<MouseWheel>", self._wheel)
             surface.bind("<Button-3>", self._show_menu)
-        self.root.bind("<Configure>", self._root_configured)
         self.root.bind("<Destroy>", self._destroy)
         self.root.bind("<Alt-F4>", lambda event: on_close())
-        self.dock.bind("<Alt-F4>", lambda event: on_close())
+        self.root.bind("<Escape>", lambda event: self._hide_controls())
+        self.root.bind(
+            "<space>",
+            lambda event: (
+                self.on_stop() if self.speech.state in {"preparing", "playing"} else self.on_start()
+            ),
+        )
         self.menu = tk.Menu(self.root, tearoff=False)
         self.menu.add_command(label="Закрыть", command=on_close)
         self.index = 0
         self.last_state = None
         self.root.update_idletasks()
-        _windows_taskbar(self.dock, secondary=True)
-        self.root.after(30, self._tick)
+        self._apply_drawer(force=True)
+        self.tick_job = self.root.after(30, self._tick)
 
     def _frame(self, index):
         key = self.animation_state, index
@@ -204,6 +223,8 @@ class SpeechWidget:
 
     def _destroy(self, event):
         if event.widget is self.root:
+            if self.tick_job is not None:
+                self.root.after_cancel(self.tick_job)
             self.portrait.close()
 
     def _update_app_icon(self):
@@ -216,45 +237,80 @@ class SpeechWidget:
     def _layout_transport(self):
         if self.panel is not None:
             self.panel.destroy()
-        layout = TransportLayout.for_portrait(self.portrait.content_box(self.size))
-        self.transport_canvas = self.dock_canvas
-        self.panel = TransportPanel(self.transport_canvas, layout)
-        self.dock_canvas.configure(width=layout.width, height=layout.height)
-        self.dock_anchor = None
+        layout = TransportLayout.for_portrait((0, 0, self.width, self.height))
+        self.transport_canvas = self.canvas
+        self.panel = TransportPanel(self.canvas, layout, self.portrait.appearance.character_name)
+        position, duration = self._progress()
+        self.panel.update(
+            position,
+            duration,
+            self.speech.state,
+            visible=True,
+            can_seek=self.on_seek is not None,
+            name=self.portrait.appearance.character_name,
+        )
+        self.canvas.itemconfigure("transport", state="hidden")
+        self.canvas.tag_raise(self.picture)
 
     def _progress(self):
         return self.speech.progress if self.on_seek is not None else (0, 0)
 
-    def _root_configured(self, event):
-        if event.widget == self.root and self.hovering:
-            self._position_dock()
-
-    def _position_dock(self):
-        anchor = (
-            self.root.winfo_rootx(),
-            self.root.winfo_rooty(),
-            self.width,
-            self.height,
-            self.panel.layout.width,
-            self.panel.layout.height,
+    def _choose_direction(self):
+        self.anchor_x = self.root.winfo_rootx()
+        self.anchor_y = self.root.winfo_rooty() + (self.drawer_pixels if self.drawer_above else 0)
+        left, top, right, bottom = _work_area(self.root)
+        self.drawer_above = (
+            self.anchor_y + self.height + self.panel.layout.height > bottom
+            and self.anchor_y - self.panel.layout.height >= top
         )
-        if anchor == self.dock_anchor:
+
+    def _apply_drawer(self, *, force=False):
+        pixels = round(self.panel.layout.height * self.drawer.value)
+        layout = self.width, self.height, pixels, self.drawer_above, self.panel.layout.height
+        if not force and self.drawer_layout == layout:
             return
-        panel_width, panel_height = anchor[-2:]
-        x, y = dock_position(anchor, _work_area(self.root))
-        self.dock_anchor = anchor
-        self.dock.geometry(f"{panel_width}x{panel_height}{x:+d}{y:+d}")
-        self.dock.update_idletasks()
+        self.drawer_layout = layout
+        self.drawer_pixels = pixels
+        offset = pixels if self.drawer_above else 0
+        self.panel_y = 0 if self.drawer_above else self.height - self.panel.layout.height + pixels
+        self.panel.move_to(self.panel_y)
+        self.canvas.coords(self.picture, 0, offset)
+        self.canvas.configure(width=self.width, height=self.height + pixels)
+        self._position_card(force=force)
+
+    def _position_card(self, *, force=False):
+        x, y = self.anchor_x, self.anchor_y - (self.drawer_pixels if self.drawer_above else 0)
+        width, height = self.width, self.height + self.drawer_pixels
+        bounds = x, y, width, height
+        if not force and self.window_bounds == bounds:
+            return
+        self.window_bounds = bounds
         if sys.platform == "win32":
             import ctypes
 
-            # Native positioning also supports monitors with negative coordinates.
             user32 = ctypes.windll.user32
-            handle = user32.GetParent(self.dock.winfo_id()) or self.dock.winfo_id()
-            user32.SetWindowPos(handle, None, x, y, panel_width, panel_height, 0x0010 | 0x0004)
+            handle = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            user32.SetWindowPos(handle, None, x, y, width, height, 0x0010 | 0x0004)
+        else:
+            self.root.geometry(f"{width}x{height}{x:+d}{y:+d}")
+        radius = (
+            min(18, round(self.width * 0.06))
+            if self.portrait.appearance.border.style == "card"
+            else 0
+        )
+        shape = width, height, radius
+        if shape != self.window_shape:
+            _round_window(self.root, *shape)
+            self.window_shape = shape
 
     def _update_transport(self):
         visible = (self.hovering or self.pressed_action is not None) and not self.dragging
+        now = time.monotonic()
+        if visible and self.drawer.target == 0 and self.drawer.value == 0:
+            self._choose_direction()
+        self.drawer.to(1 if visible else 0, now)
+        self.drawer.at(now)
+        self._apply_drawer()
         position, duration = self._progress()
         if self.seek_preview is not None:
             position = self.seek_preview
@@ -262,24 +318,23 @@ class SpeechWidget:
             position,
             duration,
             self.speech.state,
-            visible=visible,
+            visible=visible or self.drawer_pixels > 0,
             hovered=self.hovered_action,
             pressed=self.pressed_action,
             can_seek=self.on_seek is not None,
+            name=self.portrait.appearance.character_name,
         )
-        if visible:
-            if not self.dock.winfo_ismapped():
-                self.dock.deiconify()
-                self.dock.update_idletasks()
-                self.dock_anchor = None
-            self._position_dock()
-        else:
-            self.dock.withdraw()
 
     def _transport_action(self, event):
         if event.widget is not self.transport_canvas:
             return None
-        return self.panel.layout.hit(event.x, event.y)
+        if not self.drawer_pixels:
+            return None
+        if (not self.drawer_above and event.y < self.height) or (
+            self.drawer_above and event.y >= self.drawer_pixels
+        ):
+            return None
+        return self.panel.layout.hit(event.x, event.y - self.panel_y)
 
     def _action_enabled(self, action):
         return self.panel.enabled(
@@ -319,14 +374,15 @@ class SpeechWidget:
             self.transport_canvas.grab_release()
         self.pressed_action = self.seek_preview = self.hovered_action = None
         self.scrubbing = False
+        if not self.drawer_pixels:
+            self.anchor_x, self.anchor_y = self.root.winfo_rootx(), self.root.winfo_rooty()
         self.width, self.height = self.portrait.canvas_size(self.size)
-        # Keep only a few scaled images, regardless of animation length or zoom.
+        # Keep only a few scaled Tk images, regardless of animation length or zoom.
         self.frames.clear()
-        self.canvas.configure(width=self.width, height=self.height)
         self.canvas.itemconfigure(self.picture, image=self._frame(self.displayed_frame))
         self._layout_transport()
+        self._apply_drawer(force=True)
         self._update_transport()
-        self.root.geometry(f"{self.width}x{self.height}")
 
     def _wheel(self, event):
         self.wheel_delta += event.delta
@@ -388,6 +444,7 @@ class SpeechWidget:
             animations.add_separator()
             animations.add_command(label="Один портрет…", command=self._choose_image)
             self.menu.add_cascade(label="Анимации персонажа", menu=animations)
+            self.menu.add_command(label="Имя персонажа…", command=self._choose_name)
             self.menu.add_command(label="Цвет рамки…", command=self._choose_color)
             widths = tk.Menu(self.menu, tearoff=False)
             self.border_width_choice = tk.IntVar(
@@ -431,6 +488,16 @@ class SpeechWidget:
         if color:
             self.on_option("border-color", color)
 
+    def _choose_name(self):
+        name = simpledialog.askstring(
+            "Имя персонажа",
+            "Имя в плеере:",
+            parent=self.root,
+            initialvalue=self.portrait.appearance.character_name,
+        )
+        if name is not None:
+            self.on_option("character-name", name)
+
     def _save_preset(self):
         name = simpledialog.askstring("Сохранить оформление", "Название пресета:", parent=self.root)
         if name:
@@ -446,8 +513,7 @@ class SpeechWidget:
     def _leave(self, event):
         if self.hide_job is not None:
             self.root.after_cancel(self.hide_job)
-        # Crossing the small gap into the detached panel must not hide it.
-        self.hide_job = self.root.after(180, self._finish_leave)
+        self.hide_job = self.root.after(280, self._finish_leave)
 
     def _finish_leave(self):
         self.hide_job = None
@@ -455,7 +521,7 @@ class SpeechWidget:
             return
         x, y = self.root.winfo_pointerxy()
         self.hovering = False
-        for window in (self.root, self.dock):
+        for window in (self.root,):
             if window.winfo_ismapped():
                 left, top = window.winfo_rootx(), window.winfo_rooty()
                 if (
@@ -466,6 +532,13 @@ class SpeechWidget:
                     break
         if not self.hovering:
             self.hovered_action = None
+        self._update_control()
+
+    def _hide_controls(self):
+        if self.pressed_action is not None:
+            self.transport_canvas.grab_release()
+        self.pressed_action = self.seek_preview = None
+        self.scrubbing = self.hovering = False
         self._update_control()
 
     def _motion(self, event):
@@ -493,7 +566,7 @@ class SpeechWidget:
                 event.x_root,
                 event.y_root,
                 self.root.winfo_x(),
-                self.root.winfo_y(),
+                self.root.winfo_y() + (self.drawer_pixels if self.drawer_above else 0),
             )
         self.dragging = False
         self._update_transport()
@@ -509,16 +582,8 @@ class SpeechWidget:
         if not self.dragging and abs(dx) + abs(dy) < 4:
             return
         self.dragging = True
-        x, y = window_x + dx, window_y + dy
-        if sys.platform == "win32":
-            # Native coordinates also work on monitors left of the main screen.
-            import ctypes
-
-            user32 = ctypes.windll.user32
-            handle = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-            user32.SetWindowPos(handle, None, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
-        else:
-            self.root.geometry(f"{x:+d}{y:+d}")
+        self.anchor_x, self.anchor_y = window_x + dx, window_y + dy
+        self._position_card()
         self._update_control()
 
     def _release(self, event):
@@ -570,7 +635,7 @@ class SpeechWidget:
             self.last_state = state
         self._update_transport()
         self._animate(state, now)
-        self.root.after(10, self._tick)
+        self.tick_job = self.root.after(10, self._tick)
 
     def _animate(self, speech_state, now):
         state = "talk" if speech_state == "playing" else "idle"
