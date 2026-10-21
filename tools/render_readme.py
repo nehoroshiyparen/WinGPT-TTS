@@ -14,7 +14,9 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-from wgtts.ui.portrait import PRESETS, Portrait
+from wgtts.ui.portrait import PRESETS, Appearance, Portrait
+from wgtts.ui.transport import ACCENT as PLAYER_ACCENT
+from wgtts.ui.transport import PANEL_BACKGROUND, DrawerMotion, TransportLayout, _button_art
 
 ROOT = Path(__file__).resolve().parents[1]
 MEDIA = ROOT / "docs" / "media"
@@ -77,9 +79,10 @@ def render_hero(portrait):
 
 
 def render_presets():
-    image = Image.new("RGB", (1120, 350), BACKGROUND)
+    image = Image.new("RGB", (24 + 274 * len(PRESETS), 350), BACKGROUND)
     draw = ImageDraw.Draw(image)
     descriptions = {
+        "modern": "modern / card / compact player",
         "classic": "classic / bevel / 9 px",
         "frost": "frost / bevel / 9 px",
         "minimal": "minimal / flat / 2 px",
@@ -94,6 +97,93 @@ def render_presets():
         position = (x + (250 - portrait.width) // 2, 92 + (221 - portrait.height) // 2)
         image.paste(portrait, position, portrait)
     image.save(MEDIA / "frames.png", optimize=True)
+
+
+def player_panel(layout, state, name, position=42, duration=130):
+    """Use the real transport geometry and button artwork in the documentation."""
+    panel = Image.new("RGBA", (layout.width, layout.height), PANEL_BACKGROUND)
+    draw = ImageDraw.Draw(panel)
+    for action, (x, y) in layout.centers.items():
+        glyph = "pause" if action == "play" and state == "playing" else action
+        button = _button_art(glyph, layout.diameter(action), "normal")
+        panel.alpha_composite(button, (round(x - button.width / 2), round(y - button.height / 2)))
+    left, right, y = layout.track
+    x = left + (right - left) * position / duration
+    draw.line((left, y, right, y), fill="#39414c", width=2)
+    draw.line((left, y, x, y), fill=PLAYER_ACCENT, width=2)
+    draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill="#e5f5ff")
+    face = font(max(10, round(11 * layout.scale)))
+    draw.text(
+        (left, y + 13 * layout.scale), f"0:{position:02d}", font=face, fill="#a7afb9", anchor="lm"
+    )
+    draw.text((right, y + 13 * layout.scale), "2:10", font=face, fill="#a7afb9", anchor="rm")
+    row_y = layout.centers["play"][1]
+    draw.text((left, row_y), name, font=face, fill="#eef1f6", anchor="lm")
+    status = {"playing": "Говорит", "paused": "Пауза"}.get(state, "Готов")
+    draw.text((right, row_y), status, font=face, fill="#a7afb9", anchor="rm")
+    return panel
+
+
+def player_card(portrait, elapsed, reveal, state="idle"):
+    mode = "talk" if state == "playing" else "idle"
+    frame = portrait.render(portrait.frame_at(elapsed, mode), 120, mode)
+    layout = TransportLayout.for_portrait((0, 0, frame.width, frame.height))
+    pixels = round(layout.height * reveal)
+    card = Image.new("RGBA", (frame.width, frame.height + pixels), PANEL_BACKGROUND)
+    panel = player_panel(layout, state, portrait.appearance.character_name)
+    card.alpha_composite(panel, (0, frame.height - layout.height + pixels))
+    card.alpha_composite(frame)
+    mask = Image.new("L", (card.width * 4, card.height * 4))
+    radius = min(18, round(card.width * 0.06))
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, mask.width - 1, mask.height - 1), radius=radius * 4, fill=255
+    )
+    card.putalpha(mask.resize(card.size, Image.Resampling.LANCZOS))
+    return card
+
+
+def render_player():
+    MEDIA.mkdir(parents=True, exist_ok=True)
+    with Portrait(Appearance()) as portrait:
+        overview = Image.new("RGBA", (680, 376), BACKGROUND)
+        draw = ImageDraw.Draw(overview)
+        for x, label, reveal, state in (
+            (40, "Ожидание", 0, "idle"),
+            (363, "Управление", 1, "playing"),
+        ):
+            draw.text((x, 24), label, font=font(14), fill=TEXT)
+            overview.alpha_composite(player_card(portrait, 0.5, reveal, state), (x, 58))
+        overview.convert("RGB").save(MEDIA / "player.png", optimize=True)
+        motion = DrawerMotion()
+        frames = []
+        for number in range(96):
+            elapsed = number / 20
+            if number == 18:
+                motion.to(1, elapsed)
+            elif number == 70:
+                motion.to(0, elapsed)
+            state = "playing" if 1.4 <= elapsed < 3.2 else "paused" if elapsed >= 3.2 else "idle"
+            frame = Image.new("RGBA", (345, 334), BACKGROUND)
+            frame.alpha_composite(
+                player_card(portrait, elapsed, motion.at(elapsed), state), (34, 24)
+            )
+            frames.append(frame.convert("RGB"))
+        frames = [
+            frame.quantize(
+                colors=256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.FLOYDSTEINBERG
+            )
+            for frame in frames
+        ]
+        frames[0].save(
+            MEDIA / "player-demo.gif",
+            save_all=True,
+            append_images=frames[1:],
+            duration=50,
+            loop=0,
+            optimize=True,
+            disposal=1,
+        )
+    print("Rendered player.png and player-demo.gif from the current player artwork and layout.")
 
 
 def read_voice(path):
@@ -247,10 +337,17 @@ def render_voice(portrait, source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio", type=Path, default=MEDIA / "voice-sample.wav")
+    parser.add_argument(
+        "--ui-only", action="store_true", help="Обновить только изображения нового плеера."
+    )
     args = parser.parse_args()
+    if args.ui_only:
+        render_player()
+        return
     if not args.audio.is_file():
         parser.error("Pass --audio with a WAV sample for the README.")
     MEDIA.mkdir(parents=True, exist_ok=True)
+    render_player()
     portrait = Portrait(PRESETS["classic"][1])
     render_hero(portrait)
     render_presets()
