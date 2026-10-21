@@ -8,7 +8,7 @@ from functools import cmp_to_key
 from comtypes import COMError
 from pywinauto import Desktop
 from pywinauto.controls.uiawrapper import UIAWrapper
-from pywinauto.findwindows import ElementNotFoundError
+from pywinauto.findwindows import ElementAmbiguousError, ElementNotFoundError
 from pywinauto.timings import TimeoutError as UIATimeoutError
 from pywinauto.uia_defines import NoPatternInterfaceError
 from pywinauto.uia_element_info import UIAElementInfo
@@ -202,27 +202,62 @@ def _message_text(span, block, pattern):
     )
 
 
+def _parent_document(node):
+    """Find the nearest document boundary without crossing the app window."""
+    parent = node.parent()
+    while parent is not None:
+        if parent.element_info.control_type == "Document":
+            return parent
+        if parent.element_info.control_type == "Window":
+            break
+        parent = parent.parent()
+    return None
+
+
+def _chat_document(window):
+    matches = []
+    for document in window.descendants(control_type="Document"):
+        if (
+            document.element_info.automation_id != "RootWebArea"
+            or not document.is_visible()
+            or _parent_document(document) is not None
+        ):
+            continue
+        for node in document.descendants(control_type="Group"):
+            if (
+                node.window_text() in {"Разговор", "Conversation"}
+                and _aria_role(node) == "region"
+                and node.is_visible()
+                and (owner := _parent_document(node)) is not None
+                and owner.element_info.runtime_id == document.element_info.runtime_id
+            ):
+                matches.append((document, node))
+    if not matches:
+        raise ReaderError("Область переписки не найдена. Открой чат в приложении ChatGPT.")
+    if len(matches) != 1:
+        raise ReaderError(
+            "Найдено несколько областей переписки. Оставь открытым один чат и повтори чтение."
+        )
+    return matches[0]
+
+
 class ChatReader:
     def connect(self) -> Context:
         try:
-            window = Desktop(backend="uia").window(title="ChatGPT", control_type="Window")
-            document = window.child_window(
-                auto_id="RootWebArea", control_type="Document"
-            ).wrapper_object()
-            candidates = document.descendants(control_type="Group")
-            conversation = next(
-                (
-                    node
-                    for node in candidates
-                    if node.window_text() in ("Разговор", "Conversation")
-                    and node.element_info.element.CurrentAriaRole == "region"
-                ),
-                None,
+            window = (
+                Desktop(backend="uia")
+                .window(title="ChatGPT", control_type="Window")
+                .wrapper_object()
             )
-            if conversation is None:
-                raise ReaderError("Область переписки не найдена. Открой чат в приложении ChatGPT.")
-            session = f"{window.wrapper_object().handle}:{document.window_text()}:{conversation.element_info.runtime_id}"
+            document, conversation = _chat_document(window)
+            session = (
+                f"{window.handle}:{document.window_text()}:{conversation.element_info.runtime_id}"
+            )
             return Context(document, conversation, document.iface_text, session)
+        except ElementAmbiguousError as error:
+            raise ReaderError(
+                "Найдено несколько окон ChatGPT. Оставь открытым нужный чат."
+            ) from error
         except (ElementNotFoundError, UIATimeoutError) as error:
             raise ReaderError("Окно ChatGPT недоступно. Открой приложение и нужный чат.") from error
         except COMError as error:

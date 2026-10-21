@@ -3,8 +3,9 @@
 import json
 import sys
 
-from pywinauto import Desktop
 from pywinauto.uia_defines import IUIA
+
+from wgtts.chat.reader import ChatReader
 
 
 def describe(element):
@@ -24,8 +25,8 @@ def describe(element):
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
-    window = Desktop(backend="uia").window(title="ChatGPT", control_type="Window")
-    document = window.child_window(auto_id="RootWebArea", control_type="Document").wrapper_object()
+    context = ChatReader().connect()
+    document = context.document
     nodes = document.descendants()
     constants = IUIA().UIA_dll
     result = {"document": describe(document), "nodes": len(nodes)}
@@ -55,14 +56,7 @@ def main():
             result["scrollables"].append(item)
         if native.GetCurrentPropertyValue(constants.UIA_IsItemContainerPatternAvailablePropertyId):
             result["containers"].append(describe(node))
-    conversation = next(
-        (
-            node
-            for node in nodes
-            if node.window_text() == "Разговор" and node.element_info.control_type == "Group"
-        ),
-        None,
-    )
+    conversation = context.conversation
     if conversation:
         parent = conversation
         children = parent.children()

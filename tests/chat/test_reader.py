@@ -2,11 +2,103 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from pywinauto.findwindows import ElementAmbiguousError
 from pywinauto.uia_defines import NoPatternInterfaceError
 
-from wgtts.chat.reader import _message_text, _read_table
+from wgtts.chat.reader import ChatReader, ReaderError, _message_text, _read_table
+
+
+class AccessibleNode:
+    def __init__(self, control, name="", *, role="", visible=True, children=()):
+        self.element_info = SimpleNamespace(
+            control_type=control,
+            automation_id="RootWebArea" if control == "Document" else "",
+            runtime_id=[id(self)],
+            element=SimpleNamespace(CurrentAriaRole=role),
+        )
+        self.name, self.visible = name, visible
+        self._parent = None
+        self._children = list(children)
+        self.iface_text = object()
+        self.handle = 123
+        for child in self._children:
+            child._parent = self
+
+    def parent(self):
+        return self._parent
+
+    def window_text(self):
+        return self.name
+
+    def is_visible(self):
+        return self.visible
+
+    def descendants(self, *, control_type):
+        nodes = []
+        for child in self._children:
+            if child.element_info.control_type == control_type:
+                nodes.append(child)
+            nodes.extend(child.descendants(control_type=control_type))
+        return nodes
+
+
+class ReaderConnectionTests(unittest.TestCase):
+    def connect(self, *documents):
+        window = AccessibleNode("Window", "ChatGPT", children=documents)
+        desktop = Mock()
+        desktop.window.return_value.wrapper_object.return_value = window
+        with patch("wgtts.chat.reader.Desktop", return_value=desktop):
+            return ChatReader().connect()
+
+    def conversation(self):
+        return AccessibleNode("Group", "Разговор", role="region")
+
+    def test_three_root_web_areas_select_chat_regardless_of_order(self):
+        conversation = self.conversation()
+        chat = AccessibleNode("Document", "My chat", children=[conversation])
+        previews = [AccessibleNode("Document", name) for name in ["Player", "Design"]]
+        first = self.connect(previews[0], chat, previews[1])
+        second = self.connect(previews[1], previews[0], chat)
+        self.assertIs(first.document, chat)
+        self.assertIs(first.conversation, conversation)
+        self.assertIs(first.pattern, chat.iface_text)
+        self.assertEqual(first.session_key, second.session_key)
+
+    def test_embedded_preview_cannot_supply_a_second_conversation(self):
+        preview = AccessibleNode("Document", "Preview", children=[self.conversation()])
+        conversation = self.conversation()
+        chat = AccessibleNode("Document", "Chat", children=[preview, conversation])
+        self.assertIs(self.connect(chat).conversation, conversation)
+
+    def test_chat_must_own_the_conversation_instead_of_reading_a_nested_preview(self):
+        preview = AccessibleNode("Document", "Preview", children=[self.conversation()])
+        chat = AccessibleNode("Document", "Chat", children=[preview])
+        with self.assertRaisesRegex(ReaderError, "Область переписки не найдена"):
+            self.connect(chat)
+
+    def test_hidden_document_and_similarly_named_heading_are_not_chats(self):
+        hidden = AccessibleNode(
+            "Document", "Old chat", visible=False, children=[self.conversation()]
+        )
+        heading = AccessibleNode("Group", "Разговор", role="heading")
+        panel = AccessibleNode("Document", "Panel", children=[heading])
+        chat = AccessibleNode("Document", "Current", children=[self.conversation()])
+        self.assertIs(self.connect(hidden, panel, chat).document, chat)
+
+    def test_two_real_chat_regions_report_a_readable_error(self):
+        first = AccessibleNode("Document", "First", children=[self.conversation()])
+        second = AccessibleNode("Document", "Second", children=[self.conversation()])
+        with self.assertRaisesRegex(ReaderError, "несколько областей переписки"):
+            self.connect(first, second)
+
+    def test_ambiguous_app_windows_do_not_leak_pywinauto_traceback(self):
+        desktop = Mock()
+        desktop.window.return_value.wrapper_object.side_effect = ElementAmbiguousError()
+        with patch("wgtts.chat.reader.Desktop", return_value=desktop):
+            with self.assertRaisesRegex(ReaderError, "несколько окон ChatGPT"):
+                ChatReader().connect()
 
 
 class TextRange:
